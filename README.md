@@ -15,7 +15,7 @@ _Inbox/          Bronze   Raw dump from phones
     ↓
   HEIC → JPG conversion
   Rename → YYYYMMDD_HHMMSS
-  SHA256 + pHash deduplication
+  SHA256 deduplication
     ↓
 _Staging/        Silver   Net-new, converted, renamed, date-sorted
     ↓
@@ -26,15 +26,14 @@ Library/         Gold     Photos — Excire-indexed, AI-tagged, searchable
 Videos/          Gold     Videos — managed separately
 ```
 
-**Photos** go through a two-pass dedup (exact SHA256 + perceptual pHash). **Videos** use SHA256 exact match only. Everything lands in a `YYYY/YYYY-MM` date-based folder structure derived from EXIF metadata.
+Both photos and videos are deduplicated by SHA256 exact match — if a file is already in the library, the incoming copy is discarded. Everything lands in a `YYYY/YYYY-MM` date-based folder structure derived from EXIF metadata.
 
 ---
 
 ## Features
 
 - **HEIC → JPG conversion** at lossless quality with EXIF preserved — handles photos from iPhones and parents
-- **Two-pass deduplication** — exact hash match catches bit-for-bit duplicates; perceptual hash (Hamming distance ≤ 2) catches the same photo at different compressions (e.g. original vs texted copy)
-- **Smart collision rules** — when duplicates are found, keeps the file with EXIF metadata, then falls back to largest file size
+- **SHA256 deduplication** — exact hash match catches bit-for-bit duplicates both within the incoming batch and against the existing library; existing library entry always wins
 - **Consistent naming** — all files renamed to `YYYYMMDD_HHMMSS.jpg` from EXIF timestamp
 - **Video routing** — MP4, MOV, and other video formats go to a separate `Videos/` folder so they don't pollute a photo library
 - **Hash manifest** — `hash_manifest.csv` tracks every file in the library so future runs only promote net-new files
@@ -54,7 +53,7 @@ cd photo-ingest-pipeline
 ### 2. Install dependencies
 
 ```bash
-pip install pillow pillow-heif piexif imagehash pandas python-dotenv
+pip install pillow pillow-heif piexif pandas python-dotenv
 ```
 
 ### 3. Create your folder structure
@@ -119,25 +118,7 @@ Logs are written to your `_Logs` folder as `YYYYMMDD_HHMMSS_run.log`. Each log s
 
 ## Deduplication Logic
 
-### Two-pass photo dedup
-
-**Pass 1 — Exact match (SHA256)**
-Bit-for-bit identical files. Fast. Runs first.
-
-**Pass 2 — Perceptual match (pHash)**
-Catches the same photo at different compressions — e.g. original HEIC from a family member vs the texted JPG version. Threshold is Hamming distance ≤ 2 (very strict, near-identical only).
-
-### Collision rules (priority order)
-
-When a duplicate is detected, the pipeline applies these rules in order:
-
-| Priority | Condition | Action |
-|----------|-----------|--------|
-| 1 | One file has EXIF, the other does not | Keep the file with EXIF |
-| 2 | Both have EXIF or neither does | Keep the larger file |
-| 3 | Same EXIF state and same size | Keep either, discard the other |
-
-The rationale: EXIF metadata is stripped when photos are shared via text, so the file with EXIF is almost always the original. Larger file size indicates less compression, also pointing to the original.
+SHA256 exact match is used for all files — photos and videos. The pre-pass checks all incoming files against each other first (first-seen wins), then survivors are checked against the manifest. If a SHA256 match is found in the manifest, the existing library entry always wins and the incoming file is discarded.
 
 Every discarded file is logged with the reason and which file was kept.
 
@@ -150,10 +131,10 @@ Every discarded file is logged with the reason and which file was kept.
 | Column | Type | Notes |
 |--------|------|-------|
 | sha256 | string | 64-char hex |
-| phash | string | 64-bit hex (null for videos) |
+| phash | string | Reserved, always empty |
 | filepath | string | Relative to library root |
-| file_size_bytes | integer | Used in collision rule 2 |
-| has_exif | boolean | Used in collision rule 1 |
+| file_size_bytes | integer | |
+| has_exif | boolean | |
 | file_type | string | "photo" or "video" |
 | date_added | date | Date of pipeline run |
 
@@ -163,7 +144,7 @@ Every discarded file is logged with the reason and which file was kept.
 
 | Type | Extensions | Processing |
 |------|-----------|------------|
-| Photos | .jpg, .jpeg, .png | Rename, dedup (SHA256 + pHash) |
+| Photos | .jpg, .jpeg, .png | Rename, dedup (SHA256) |
 | Photos | .heic, .heif | Convert to JPG, rename, dedup |
 | Videos | .mp4, .mov, others | Rename, dedup (SHA256 only) |
 | Unknown | anything else | Skipped, logged |
@@ -178,7 +159,6 @@ Every discarded file is logged with the reason and which file was kept.
 | pillow-heif | HEIC → JPG conversion |
 | piexif | EXIF read/write/copy |
 | hashlib | SHA256 hashing (stdlib) |
-| imagehash | pHash computation |
 | pandas | hash_manifest.csv I/O |
 | pathlib | File and folder ops (stdlib) |
 | python-dotenv | .env config loading |

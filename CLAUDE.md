@@ -66,25 +66,11 @@ Run in this exact order for each file:
 
 **2d. Deduplication** (against hash_manifest.csv)
 
-Photos — Two-pass dedup:
-
-  Pass 1 - Exact match (SHA256):
+Both photos and videos — SHA256 exact match only:
   - Compute SHA256 of file
   - Look up in MANIFEST
-  - No match -> proceed to Pass 2
-  - Match found -> apply collision rules (see below)
-
-  Pass 2 - Perceptual match (pHash):
-  - Compute pHash using ImageHash library
-  - Compare against all pHash values in MANIFEST
-  - Hamming distance <= 2 -> near-duplicate, apply collision rules
-  - Hamming distance > 2 -> treat as unique, pass to Silver
-
-Videos — SHA256 exact match only (pHash on video is too slow):
-  - Compute SHA256 of file
-  - Look up in MANIFEST
-  - No match -> pass to STAGING_VIDEOS
-  - Match found -> apply collision rules (see below)
+  - No match -> pass to Silver
+  - Match found -> existing always wins, discard incoming, log it
 
 **2e. Date-sort into Silver**
 - Read EXIF/metadata timestamp
@@ -100,27 +86,15 @@ Videos — SHA256 exact match only (pHash on video is too slow):
 
 ---
 
-## Collision Rules (priority order)
-
-When any dedup pass detects a duplicate, apply these rules in order:
-
-1. **EXIF present in one file, not the other** -> keep the file with EXIF
-2. **Both have EXIF or neither does** -> keep the larger file (bytes)
-3. **Same EXIF state and same size** -> keep either, discard the other
-
-Every discarded file must be logged: filename, reason, and which file was kept.
-
----
-
 ## hash_manifest.csv Schema
 
 | Column          | Type    | Notes                                          |
 |-----------------|---------|------------------------------------------------|
 | sha256          | string  | 64-char hex                                    |
-| phash           | string  | 64-bit hex (null for videos)                   |
+| phash           | string  | Reserved, always empty                         |
 | filepath        | string  | Relative to library root                       |
-| file_size_bytes | integer | Used in collision rule 2                       |
-| has_exif        | boolean | Used in collision rule 1                       |
+| file_size_bytes | integer |                                                |
+| has_exif        | boolean |                                                |
 | file_type       | string  | "photo" or "video"                             |
 | date_added      | date    | Date of pipeline run (YYYY-MM-DD)              |
 
@@ -132,8 +106,7 @@ Write to LOGS\YYYYMMDD_HHMMSS_run.log after every run:
 - Run date and time
 - Total file count from INBOX (photos and videos separately)
 - HEIC files converted
-- Files discarded at Pass 1 (exact duplicate) with reason
-- Files discarded at Pass 2 (perceptual duplicate) with Hamming distance and reason
+- Files discarded as duplicates (SHA256 match) with reason
 - Net-new photos promoted to LIBRARY
 - Net-new videos promoted to VIDEOS
 - Any errors or warnings
@@ -156,7 +129,6 @@ python pipeline.py
 | pillow-heif  | HEIC -> JPG conversion   | pip install pillow-heif         |
 | piexif       | EXIF read/write/copy     | pip install piexif              |
 | hashlib      | SHA256 hashing           | stdlib                          |
-| ImageHash    | pHash computation        | pip install imagehash           |
 | pandas       | hash_manifest.csv I/O    | pip install pandas              |
 | pathlib      | File and folder ops      | stdlib                          |
 | python-dotenv| .env config loading      | pip install python-dotenv       |
@@ -169,8 +141,7 @@ python pipeline.py
 - Files are copied from phones by the user manually before running the script
 - Bronze (INBOX) is never modified except cleared at end of successful run
 - HEIC conversion happens in Bronze -> Silver stage (Bronze stays in original format)
-- Photos use two-pass dedup (SHA256 + pHash); videos use SHA256 exact match only
-- pHash threshold is Hamming distance <= 2 (very strict, near-identical only)
+- All files (photos and videos) use SHA256 exact match only for dedup; existing library entry always wins
 - Phone attribution is not tracked (captured in device EXIF metadata anyway)
 - LIBRARY is photos only — Excire Foto watches this folder
 - VIDEOS is videos only — Excire does not watch this folder
