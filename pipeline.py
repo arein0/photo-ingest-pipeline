@@ -7,7 +7,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import imagehash
 import pandas as pd
 import piexif
 import pillow_heif
@@ -15,6 +14,7 @@ from dotenv import load_dotenv
 from PIL import Image
 
 load_dotenv(Path(__file__).parent / ".env")
+pillow_heif.register_heif_opener()
 
 def _require_env(key: str) -> Path:
     val = os.getenv(key)
@@ -39,7 +39,6 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v", ".wmv", ".flv", ".
 
 MANIFEST_COLS = ["sha256", "phash", "filepath", "file_size_bytes", "has_exif", "file_type", "date_added"]
 
-PHASH_THRESHOLD = 2
 
 # ---------------------------------------------------------------------------
 # Logging setup — log to both console and an in-memory list for the run log
@@ -69,7 +68,6 @@ stats: dict = {
     "inbox_skipped": 0,
     "heic_converted": 0,
     "exact_dupes": [],       # list of dicts
-    "perceptual_dupes": [],  # list of dicts
     "photos_promoted": 0,
     "videos_promoted": 0,
     "errors": [],
@@ -108,13 +106,6 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def phash_file(path: Path) -> str:
-    with Image.open(path) as img:
-        return str(imagehash.phash(img))
-
-
-def phash_distance(a: str, b: str) -> int:
-    return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 # ---------------------------------------------------------------------------
 # EXIF helpers
@@ -150,38 +141,12 @@ def get_timestamp(path: Path) -> datetime:
         return dt
     return datetime.fromtimestamp(path.stat().st_mtime)
 
-# ---------------------------------------------------------------------------
-# Collision resolution
-# ---------------------------------------------------------------------------
-
-def resolve_collision(incoming: Path, existing_filepath: str) -> bool:
-    """
-    Returns True if incoming wins (keep incoming, discard existing record).
-    Returns False if existing wins (discard incoming).
-    """
-    existing = PHOTOS_ROOT / existing_filepath
-    inc_exif = has_exif(incoming)
-    # existing may be in gold already; check both photo and video trees
-    if not existing.exists():
-        # can't compare — keep existing record, discard incoming
-        return False
-    ext_exif = has_exif(existing)
-
-    if inc_exif and not ext_exif:
-        return True
-    if ext_exif and not inc_exif:
-        return False
-    # rule 2: larger file wins
-    if incoming.stat().st_size > existing.stat().st_size:
-        return True
-    return False
 
 # ---------------------------------------------------------------------------
 # Stage 2b — HEIC conversion
 # ---------------------------------------------------------------------------
 
 def convert_heic(src: Path) -> Path:
-    pillow_heif.register_heif_opener()
     jpg_path = src.with_suffix(".jpg")
     with Image.open(src) as img:
         # preserve EXIF if present
@@ -220,72 +185,16 @@ def rename_file(path: Path, dest_dir: Path, ext_override: str | None = None) -> 
 # Stage 2d — Dedup
 # ---------------------------------------------------------------------------
 
-def dedup_photo(path: Path, manifest: pd.DataFrame) -> tuple[bool, pd.DataFrame]:
-    """
-    Returns (keep: bool, manifest).
-    If incoming wins a collision, the old manifest row is dropped and True returned.
-    If incoming loses, False returned and manifest unchanged.
-    """
-    sha = sha256_file(path)
-
-    # Pass 1 — exact match
-    exact = manifest[manifest["sha256"] == sha]
-    if not exact.empty:
-        row = exact.iloc[0]
-        if resolve_collision(path, row["filepath"]):
-            manifest = manifest[manifest["sha256"] != sha].reset_index(drop=True)
-            logger.info(f"Exact dupe (incoming wins): {path.name} over {row['filepath']}")
-            stats["exact_dupes"].append({"file": path.name, "reason": "exact SHA256", "kept": path.name, "discarded": row["filepath"]})
-            return True, manifest
-        else:
-            logger.info(f"Exact dupe (existing wins): {path.name} discarded, kept {row['filepath']}")
-            stats["exact_dupes"].append({"file": path.name, "reason": "exact SHA256", "kept": row["filepath"], "discarded": path.name})
-            path.unlink()
-            return False, manifest
-
-    # Pass 2 — perceptual match
-    try:
-        inc_phash = phash_file(path)
-    except Exception as e:
-        logger.warning(f"pHash failed for {path.name}: {e}; treating as unique")
-        return True, manifest
-
-    phash_rows = manifest[manifest["phash"].notna() & (manifest["phash"] != "")]
-    for _, row in phash_rows.iterrows():
-        try:
-            dist = phash_distance(inc_phash, row["phash"])
-        except Exception:
-            continue
-        if dist <= PHASH_THRESHOLD:
-            if resolve_collision(path, row["filepath"]):
-                manifest = manifest[manifest["sha256"] != row["sha256"]].reset_index(drop=True)
-                logger.info(f"Perceptual dupe (incoming wins, dist={dist}): {path.name} over {row['filepath']}")
-                stats["perceptual_dupes"].append({"file": path.name, "hamming": dist, "kept": path.name, "discarded": row["filepath"]})
-                return True, manifest
-            else:
-                logger.info(f"Perceptual dupe (existing wins, dist={dist}): {path.name} discarded, kept {row['filepath']}")
-                stats["perceptual_dupes"].append({"file": path.name, "hamming": dist, "kept": row["filepath"], "discarded": path.name})
-                path.unlink()
-                return False, manifest
-
-    return True, manifest
-
-
-def dedup_video(path: Path, manifest: pd.DataFrame) -> tuple[bool, pd.DataFrame]:
+def dedup_against_manifest(path: Path, manifest: pd.DataFrame) -> tuple[bool, pd.DataFrame]:
+    """SHA256 match against manifest → existing always wins, incoming is discarded."""
     sha = sha256_file(path)
     exact = manifest[manifest["sha256"] == sha]
     if not exact.empty:
         row = exact.iloc[0]
-        if resolve_collision(path, row["filepath"]):
-            manifest = manifest[manifest["sha256"] != sha].reset_index(drop=True)
-            logger.info(f"Video exact dupe (incoming wins): {path.name} over {row['filepath']}")
-            stats["exact_dupes"].append({"file": path.name, "reason": "exact SHA256 (video)", "kept": path.name, "discarded": row["filepath"]})
-            return True, manifest
-        else:
-            logger.info(f"Video exact dupe (existing wins): {path.name} discarded, kept {row['filepath']}")
-            stats["exact_dupes"].append({"file": path.name, "reason": "exact SHA256 (video)", "kept": row["filepath"], "discarded": path.name})
-            path.unlink()
-            return False, manifest
+        logger.info(f"Exact dupe: {path.name} discarded, already in library as {row['filepath']}")
+        stats["exact_dupes"].append({"file": path.name, "reason": "exact SHA256", "kept": row["filepath"], "discarded": path.name})
+        path.unlink()
+        return False, manifest
     return True, manifest
 
 # ---------------------------------------------------------------------------
@@ -307,6 +216,37 @@ def stage_file(path: Path, silver_root: Path) -> Path:
     return dest
 
 # ---------------------------------------------------------------------------
+# Pre-pass — intra-batch deduplication within _Inbox
+# ---------------------------------------------------------------------------
+
+def intra_batch_dedup(all_files: list[Path]) -> list[Path]:
+    """
+    Dedup incoming files against each other before touching the manifest.
+    Both photos and videos use SHA256 exact match only.
+    Returns the list of survivors.
+    """
+    photos = [f for f in all_files if f.suffix.lower() in PHOTO_EXTS]
+    videos = [f for f in all_files if f.suffix.lower() in VIDEO_EXTS]
+    survivors: list[Path] = []
+
+    for label, group in (("photo", photos), ("video", videos)):
+        sha_to_file: dict[str, Path] = {}
+        for f in group:
+            sha = sha256_file(f)
+            if sha not in sha_to_file:
+                sha_to_file[sha] = f
+            else:
+                # SHA256 match = byte-identical; first seen wins
+                winner = sha_to_file[sha]
+                f.unlink()
+                logger.info(f"Batch exact dupe ({label}): {f.name} discarded, kept {winner.name}")
+                stats["exact_dupes"].append({"file": f.name, "reason": f"batch exact SHA256 ({label})", "kept": winner.name, "discarded": f.name})
+        survivors.extend(sha_to_file.values())
+
+    return survivors
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 — Bronze -> Silver
 # ---------------------------------------------------------------------------
 
@@ -315,8 +255,11 @@ def process_inbox(manifest: pd.DataFrame) -> tuple[pd.DataFrame, list[Path], lis
     staged_photos: list[Path] = []
     staged_videos: list[Path] = []
 
-    # Collect all files recursively from Inbox
+    # Collect all files recursively from Inbox, then dedup within the batch
     all_files = [f for f in INBOX.rglob("*") if f.is_file()]
+    logger.info(f"Inbox contains {len(all_files)} files before batch dedup")
+    all_files = intra_batch_dedup(all_files)
+    logger.info(f"{len(all_files)} files survive batch dedup, processing against manifest")
 
     for src in all_files:
         ext = src.suffix.lower()
@@ -351,7 +294,7 @@ def process_inbox(manifest: pd.DataFrame) -> tuple[pd.DataFrame, list[Path], lis
                 work_path = renamed
 
                 # 2d — dedup
-                keep, manifest = dedup_photo(work_path, manifest)
+                keep, manifest = dedup_against_manifest(work_path, manifest)
                 if not keep:
                     continue
 
@@ -366,7 +309,7 @@ def process_inbox(manifest: pd.DataFrame) -> tuple[pd.DataFrame, list[Path], lis
                 work_path = renamed
 
                 # 2d — dedup (SHA256 only)
-                keep, manifest = dedup_video(work_path, manifest)
+                keep, manifest = dedup_against_manifest(work_path, manifest)
                 if not keep:
                     continue
 
@@ -405,13 +348,9 @@ def promote_to_gold(
             shutil.move(str(photo), str(dest))
 
             sha = sha256_file(dest)
-            try:
-                ph = phash_file(dest)
-            except Exception:
-                ph = ""
             manifest = append_manifest_row(manifest, {
                 "sha256": sha,
-                "phash": ph,
+                "phash": "",
                 "filepath": str(dest.relative_to(PHOTOS_ROOT)),
                 "file_size_bytes": dest.stat().st_size,
                 "has_exif": has_exif(dest),
@@ -476,18 +415,11 @@ def write_run_log(run_start: datetime) -> None:
         f"=== HEIC Conversions ===",
         f"  Converted : {stats['heic_converted']}",
         "",
-        "=== Exact Duplicates (Pass 1) ===",
+        "=== Duplicates Discarded ===",
     ]
     if stats["exact_dupes"]:
         for d in stats["exact_dupes"]:
             lines.append(f"  {d['file']}  reason={d['reason']}  kept={d['kept']}  discarded={d['discarded']}")
-    else:
-        lines.append("  (none)")
-
-    lines += ["", "=== Perceptual Duplicates (Pass 2) ==="]
-    if stats["perceptual_dupes"]:
-        for d in stats["perceptual_dupes"]:
-            lines.append(f"  {d['file']}  hamming={d['hamming']}  kept={d['kept']}  discarded={d['discarded']}")
     else:
         lines.append("  (none)")
 
