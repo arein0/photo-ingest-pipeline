@@ -249,10 +249,9 @@ def process_inbox(
                     work_path, fp, working_records, PHOTOS_ROOT
                 )
 
-                if decision is not None and decision.classification in ("exact", "near_definite"):
-                    # Clear loser; if incoming wins, also pull existing from library
+                if decision is not None:
                     q_path = quarantine(PHOTOS_ROOT, decision, REVIEW)
-                    append_review_log(REVIEW, decision, q_path)
+                    append_review_log(REVIEW, decision, q_path, PHOTOS_ROOT, LIBRARY)
                     bucket = stats[f"dupes_{decision.classification}"]
                     bucket.append({
                         "file": work_path.name,
@@ -261,41 +260,32 @@ def process_inbox(
                         "kept": decision.keep,
                         "existing": decision.existing_relpath,
                     })
-                    if decision.keep != "existing":
-                        # incoming wins — remove old record from working list
-                        working_records = [
-                            r for r in working_records
-                            if r.filepath != decision.existing_relpath
-                        ]
-                        logger.warning(
-                            f"Incoming wins over library file: {work_path.name} "
-                            f"replaces {decision.existing_relpath} (quarantined)"
+
+                    if decision.classification == "review":
+                        # Human decides later via `dedup.py apply-review`. Library untouched.
+                        logger.info(
+                            f"Review: {work_path.name} quarantined "
+                            f"(inliers={decision.score:.0f}, candidate={decision.existing_relpath})"
                         )
-                        # fall through — promote incoming below
-                    else:
-                        if work_path.exists():
-                            work_path.unlink()
+                        continue
+
+                    # exact / near_definite: incoming may have won the collision
+                    if decision.keep in ("existing", "either"):
                         logger.info(
                             f"Dupe ({decision.classification}): {work_path.name} "
                             f"quarantined, kept {decision.existing_relpath}"
                         )
                         continue
 
-                elif decision is not None and decision.classification == "review":
-                    # Quarantine incoming; human decides
-                    q_path = quarantine(PHOTOS_ROOT, decision, REVIEW)
-                    append_review_log(REVIEW, decision, q_path)
-                    stats["dupes_review"].append({
-                        "file": work_path.name,
-                        "method": decision.method,
-                        "score": decision.score,
-                        "existing": decision.existing_relpath,
-                    })
-                    logger.info(
-                        f"Review: {work_path.name} quarantined for human review "
-                        f"(inliers={decision.score:.0f}, existing={decision.existing_relpath})"
+                    # incoming won — existing was just quarantined; promote incoming
+                    working_records = [
+                        r for r in working_records
+                        if r.filepath != decision.existing_relpath
+                    ]
+                    logger.warning(
+                        f"Incoming wins over library file: {work_path.name} "
+                        f"replaces {decision.existing_relpath} (quarantined)"
                     )
-                    continue
 
                 # 2e — date-sort into Silver; accumulate fingerprint for in-run dedup
                 staged = stage_file(work_path, STAGING)
@@ -315,13 +305,11 @@ def process_inbox(
 
                 if decision is not None:
                     q_path = quarantine(PHOTOS_ROOT, decision, REVIEW)
-                    append_review_log(REVIEW, decision, q_path)
+                    append_review_log(REVIEW, decision, q_path, PHOTOS_ROOT, LIBRARY)
                     stats["dupes_exact"].append({
                         "file": work_path.name, "reason": "exact SHA256 (video)",
                         "kept": decision.existing_relpath, "discarded": work_path.name,
                     })
-                    if work_path.exists():
-                        work_path.unlink()
                     continue
 
                 staged = stage_file(work_path, STAGING_VID)

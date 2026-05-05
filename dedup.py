@@ -54,8 +54,9 @@ MANIFEST_COLS = [
 ]
 
 REVIEW_LOG_COLS = [
-    "timestamp", "classification", "method", "score",
-    "kept_file", "quarantined_file", "reason",
+    "timestamp", "classification", "score",
+    "file_in_review", "file_in_library",
+    "reason", "status",
 ]
 
 # ---------------------------------------------------------------------------
@@ -375,20 +376,20 @@ def quarantine(
     """
     Move the loser into review_root/<classification>/. Never deletes.
     Returns the quarantine destination path.
+
+    For 'review' classification, always quarantine the incoming — the library
+    is sacrosanct until the human confirms the match.
     """
     dest_dir = review_root / decision.classification
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    if decision.keep == "existing":
-        # incoming loses
+    if decision.classification == "review" or decision.keep in ("existing", "either"):
         loser_path = decision.incoming_path
-        loser_name = loser_path.name
     else:
-        # existing loses (or "either" — quarantine existing)
+        # exact / near_definite where incoming wins per collision rules
         loser_path = photos_root / decision.existing_relpath
-        loser_name = loser_path.name
 
-    dest = dest_dir / loser_name
+    dest = dest_dir / loser_path.name
     counter = 1
     while dest.exists():
         dest = dest_dir / f"{loser_path.stem}_{counter}{loser_path.suffix}"
@@ -405,26 +406,39 @@ def append_review_log(
     review_root: Path,
     decision: DupDecision,
     quarantined_path: Path,
+    photos_root: Path,
+    library_root: Path,
 ) -> None:
+    """Append a row describing the duplicate event. The user fills in `status`."""
     log_path = review_root / "review_log.csv"
     is_new = not log_path.exists() or log_path.stat().st_size == 0
+
+    # file_in_library = whatever the user should compare the quarantined file against.
+    # For review-band and most exact/near_definite cases this is the existing library file.
+    # For the rare "incoming wins" case, it's where the incoming will be after promotion.
+    if decision.classification == "review" or decision.keep in ("existing", "either"):
+        file_in_library = photos_root / decision.existing_relpath
+    else:
+        # incoming wins: it'll be promoted to library_root/YYYY/YYYY-MM/<name>
+        stem = decision.incoming_path.stem
+        try:
+            year, month = stem[0:4], stem[4:6]
+            file_in_library = library_root / year / f"{year}-{month}" / decision.incoming_path.name
+        except Exception:
+            file_in_library = decision.incoming_path
+
     with open(log_path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=REVIEW_LOG_COLS)
         if is_new:
             w.writeheader()
-        kept = (
-            decision.existing_relpath
-            if decision.keep == "existing"
-            else str(decision.incoming_path.name)
-        )
         w.writerow({
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "classification": decision.classification,
-            "method": decision.method,
-            "score": decision.score,
-            "kept_file": kept,
-            "quarantined_file": str(quarantined_path),
+            "score": f"{decision.score:.0f}",
+            "file_in_review": str(quarantined_path),
+            "file_in_library": str(file_in_library),
             "reason": decision.reason,
+            "status": "",
         })
 
 # ---------------------------------------------------------------------------
@@ -470,6 +484,99 @@ def _cli_scan(folder: Path) -> None:
     print(f"\n{len(definite)} definite, {len(review)} review, {len(fps) - len(definite) - len(review)} unique")
 
 
+def _cli_apply_review() -> None:
+    """
+    Read review_log.csv. For each row with a non-empty status:
+      - 'delete' -> remove file_in_review
+      - 'keep'   -> move file_in_review back into the library + add to manifest
+    Drop processed rows. Leave blank-status rows in place for next time.
+    """
+    import os
+    import shutil
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+
+    review_root  = Path(os.environ["REVIEW"])
+    library_root = Path(os.environ["LIBRARY"])
+    photos_root  = Path(os.environ["INBOX"]).parent
+    manifest     = Path(os.environ["MANIFEST"])
+
+    log_path = review_root / "review_log.csv"
+    if not log_path.exists():
+        print(f"No review log at {log_path}.")
+        return
+
+    with open(log_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    pending: list[dict] = []
+    deleted = restored = skipped = 0
+    errors: list[str] = []
+
+    for row in rows:
+        status = (row.get("status") or "").strip().lower()
+        review_file = Path(row.get("file_in_review", ""))
+
+        if not status:
+            pending.append(row)
+            continue
+
+        if status == "delete":
+            try:
+                if review_file.exists():
+                    review_file.unlink()
+                    print(f"  deleted  {review_file.name}")
+                else:
+                    print(f"  (already gone) {review_file.name}")
+                deleted += 1
+            except Exception as e:
+                errors.append(f"delete {review_file}: {e}")
+                pending.append(row)
+
+        elif status == "keep":
+            if not review_file.exists():
+                errors.append(f"keep {review_file}: file not found in review")
+                pending.append(row)
+                continue
+            try:
+                # Derive YYYY/YYYY-MM from filename stem (YYYYMMDD_HHMMSS...)
+                stem = review_file.stem
+                year, month = stem[0:4], stem[4:6]
+                dest_dir = library_root / year / f"{year}-{month}"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / review_file.name
+                counter = 1
+                while dest.exists():
+                    dest = dest_dir / f"{review_file.stem}_{counter}{review_file.suffix}"
+                    counter += 1
+                shutil.move(str(review_file), str(dest))
+
+                fp = compute_fingerprint(dest, photos_root)
+                append_manifest(manifest, [fp])
+                print(f"  restored {review_file.name} -> {dest.relative_to(photos_root)}")
+                restored += 1
+            except Exception as e:
+                errors.append(f"keep {review_file}: {e}")
+                pending.append(row)
+        else:
+            print(f"  WARN unknown status '{status}' for {review_file.name}, leaving pending")
+            skipped += 1
+            pending.append(row)
+
+    # Rewrite log with only the rows still pending decision
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=REVIEW_LOG_COLS)
+        w.writeheader()
+        w.writerows(pending)
+
+    print()
+    print(f"Done: {deleted} deleted, {restored} restored, {skipped} unknown-status, {len(pending)} pending")
+    if errors:
+        print("\nErrors:")
+        for e in errors:
+            print(f"  {e}")
+
+
 def _cli_against_library(file: Path) -> None:
     """Check one file against the existing manifest. Reads .env for paths."""
     import os
@@ -493,19 +600,27 @@ def _cli_against_library(file: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("Usage:")
         print("  python dedup.py scan <folder>")
         print("  python dedup.py against-library <file>")
+        print("  python dedup.py apply-review")
         sys.exit(1)
 
     cmd = sys.argv[1]
-    target = Path(sys.argv[2])
 
-    if cmd == "scan":
-        _cli_scan(target)
+    if cmd == "apply-review":
+        _cli_apply_review()
+    elif cmd == "scan":
+        if len(sys.argv) < 3:
+            print("scan requires a folder path")
+            sys.exit(1)
+        _cli_scan(Path(sys.argv[2]))
     elif cmd == "against-library":
-        _cli_against_library(target)
+        if len(sys.argv) < 3:
+            print("against-library requires a file path")
+            sys.exit(1)
+        _cli_against_library(Path(sys.argv[2]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

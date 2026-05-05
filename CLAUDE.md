@@ -94,12 +94,17 @@ Against manifest (per file, after rename):
 
   Quarantine behavior:
     - Losers are MOVED to REVIEW/<classification>/. Nothing is auto-deleted.
-    - review_log.csv in REVIEW/ records every quarantine event with timestamp,
-      classification, method, score, kept_file, quarantined_file, reason.
-    - Collision rules for deciding keep/loser:
+    - For 'review' classification, the incoming file is ALWAYS quarantined.
+      The library is sacrosanct until the human confirms.
+    - For 'exact' / 'near_definite', collision rules pick the loser:
         1. File with EXIF wins over file without EXIF
         2. Larger file wins if EXIF state is equal
         3. "Either" if same EXIF state and same size
+    - review_log.csv in REVIEW/ records every quarantine event with columns:
+        timestamp, classification, score, file_in_review, file_in_library,
+        reason, status
+    - The user fills in `status` ("delete" or "keep") and runs
+      `python dedup.py apply-review` to act on it. See the workflow section.
 
 **2e. Date-sort into Silver**
 - Read EXIF/metadata timestamp
@@ -156,7 +161,24 @@ It can also run ad hoc:
 ```
 python dedup.py scan <folder>           # find duplicates within a folder
 python dedup.py against-library <file>  # check one file against the manifest
+python dedup.py apply-review            # process review_log.csv decisions
 ```
+
+### Review workflow
+
+After `pipeline.py` finishes, any duplicates it found sit in REVIEW/<bucket>/
+and a row appears in REVIEW/review_log.csv. To resolve them:
+
+1. Open REVIEW/review_log.csv in Excel or any CSV editor.
+2. For each row, look at file_in_review and file_in_library, decide.
+3. Fill in the `status` column:
+     - `delete` -> the quarantined file gets removed
+     - `keep`   -> the quarantined file is moved into LIBRARY/YYYY/YYYY-MM/
+                   and a new row is appended to hash_manifest.csv
+     - blank    -> leave for next time
+4. Save the CSV.
+5. Run `python dedup.py apply-review`. Processed rows are removed; blank-status
+   rows remain in the file for the next pass.
 
 CONFIG class at the top of `dedup.py` holds all tunables with comments.
 Key thresholds (ORB inlier counts):
