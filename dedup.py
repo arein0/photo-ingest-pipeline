@@ -185,10 +185,12 @@ def _dhash_distance(a: str, b: str) -> int:
 
 
 def _colorhash_distance(a: str, b: str) -> int:
-    if not a or not b:
+    # imagehash.colorhash produces a non-square hash that hex_to_hash can't parse,
+    # but the string is still plain hex — popcount of XOR gives the Hamming distance.
+    if not a or not b or len(a) != len(b):
         return 9999
     try:
-        return imagehash.hex_to_hash(a) - imagehash.hex_to_hash(b)
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
     except Exception:
         return 9999
 
