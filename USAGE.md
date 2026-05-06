@@ -81,6 +81,21 @@ python dedup.py against-library D:\some\photo.jpg
 
 Computes a fingerprint for the single file and looks it up in `hash_manifest.csv`. Prints classification (`exact`, `near_definite`, `review`, or `not_duplicate`) plus the matching library path if found. Useful for spot-checking before manually adding a file.
 
+#### `scan --quarantine` — find AND quarantine in one shot
+
+```
+python dedup.py scan D:\Pictures\Library --quarantine
+```
+
+Same as `scan` but moves every DEFINITE match (exact / near_definite) into `_Review\<bucket>\` and writes a row to `review_log.csv`. REVIEW-band matches are still printed but NOT auto-quarantined — you decide those manually. Use this for an end-to-end audit:
+
+```
+python dedup.py scan D:\Pictures\Library --quarantine    # find + quarantine
+                                                          # triage review_log.csv
+python dedup.py apply-review                              # act on decisions
+python dedup.py prune-manifest                            # clean phantom rows
+```
+
 #### `apply-review` — process review decisions
 
 ```
@@ -91,12 +106,36 @@ Reads `_Review\review_log.csv`. For each row with a non-empty `status`:
 
 | status | action |
 |---|---|
-| `delete` | removes `file_in_review`; drops the row |
-| `keep` | moves `file_in_review` into `Library\YYYY\YYYY-MM\` (date from filename), appends fingerprint to manifest, drops the row |
+| `delete` | adds the file's SHA to `hash_skiplist.csv` (so future imports of the same bytes are silently dropped), removes `file_in_review`, drops the row |
+| `keep` | moves `file_in_review` into `Library\YYYY\YYYY-MM\` (date from filename), appends fingerprint to manifest, drops the row. If the row was a perceptual match (review / near_definite), the SHA pair is also added to `not_duplicates.csv` so future scans don't re-flag the same pair. |
 | _(blank)_ | row stays for next time |
 | anything else | logs a warning, leaves row pending |
 
 Status check is case-insensitive. Re-run the command after editing the CSV — it's idempotent.
+
+#### `prune-manifest` — drop manifest rows for missing files
+
+```
+python dedup.py prune-manifest
+```
+
+Walks every row in `hash_manifest.csv` and drops the ones whose `filepath` no longer exists on disk. Each pruned row's SHA is added to `hash_skiplist.csv` with `source=pruned_phantom`, so re-importing that file is still silently caught. Run this any time you've deleted files from `Library\` directly.
+
+#### `skip <file>` — manually add a SHA to the skiplist
+
+```
+python dedup.py skip "D:\some\photo.jpg"
+```
+
+Computes the file's SHA-256 and appends it to `hash_skiplist.csv`. Future imports of the exact same bytes will be silently dropped.
+
+#### `allow <fileA> <fileB>` — manually allowlist a pair
+
+```
+python dedup.py allow "D:\Library\2024\2024-06\A.jpg" "D:\Library\2024\2024-06\B.jpg"
+```
+
+Records the two SHAs as a known-not-duplicate pair in `not_duplicates.csv`. Future scans will not flag this specific pair as a duplicate, even if ORB inliers are high. Useful for recurring false positives (e.g. a particular burst-mode pair that always shows up in REVIEW).
 
 ---
 
@@ -204,8 +243,22 @@ All from `.env`:
 | `MANIFEST` | `D:\Pictures\hash_manifest.csv` | Dedup index |
 | `LOGS` | `D:\Pictures\_Logs\` | Per-run logs |
 | `REVIEW` | `D:\Pictures\_Review\` | Quarantine + `review_log.csv` |
+| `SKIPLIST` _(optional)_ | `<MANIFEST.parent>\hash_skiplist.csv` | SHAs to silently drop on import |
+| `NOT_DUPLICATES` _(optional)_ | `<MANIFEST.parent>\not_duplicates.csv` | SHA pairs declared NOT a duplicate |
 
-`PHOTOS_ROOT` is derived as `INBOX.parent` — change all of these together.
+`PHOTOS_ROOT` is derived as `INBOX.parent` — change all of these together. `SKIPLIST` and `NOT_DUPLICATES` default to alongside the manifest if unset; only set them if you want them somewhere else.
+
+### How the lists work together
+
+```
+hash_manifest.csv     "what's in the library right now"
+hash_skiplist.csv     "SHAs we never want to ingest again"
+not_duplicates.csv    "pairs of SHAs that look similar but are NOT duplicates"
+```
+
+- `pipeline.py` checks the **skiplist** before doing any dedup work — instant silent discard for repeat imports of files you've already deleted as duplicates.
+- `find_duplicates_against_manifest` checks the **not_duplicates** allowlist after ORB scores a pair — suppresses pairs you've already triaged as unique. Per-pair, not per-file: marking (A,B) as not-duplicate doesn't suppress (A,C) or (B,D).
+- `apply-review` automatically writes to both: `delete` → skiplist; `keep` on a perceptual row → not_duplicates pair.
 
 ---
 

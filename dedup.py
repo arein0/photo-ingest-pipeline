@@ -59,6 +59,13 @@ REVIEW_LOG_COLS = [
     "reason", "status",
 ]
 
+SKIPLIST_COLS = ["sha256", "name", "source", "date"]
+
+NOT_DUPLICATES_COLS = [
+    "sha256_a", "sha256_b", "name_a", "name_b",
+    "decided_at", "note",
+]
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -271,6 +278,99 @@ def append_manifest(manifest_path: Path, records: list[FingerprintRecord]) -> No
             w.writerow(r.to_csv_row())
 
 
+# ---------------------------------------------------------------------------
+# Skiplist (SHAs we never want to ingest again)
+# ---------------------------------------------------------------------------
+
+def load_skiplist(path: Path) -> set[str]:
+    """Load SHAs from skiplist CSV. Missing file is fine (returns empty set)."""
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    out: set[str] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            sha = row.get("sha256", "").strip()
+            if sha:
+                out.add(sha)
+    return out
+
+
+def append_skiplist(
+    path: Path, sha: str, name: str = "", source: str = "manual", note: str = ""
+) -> None:
+    """Append a SHA to the skiplist. Creates the file with header if missing."""
+    is_new = not path.exists() or path.stat().st_size == 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SKIPLIST_COLS)
+        if is_new:
+            w.writeheader()
+        w.writerow({
+            "sha256": sha,
+            "name": name,
+            "source": source,
+            "date": date.today().isoformat(),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Not-duplicates allowlist (pairs we've declared unique despite ORB similarity)
+# ---------------------------------------------------------------------------
+
+def load_not_duplicates(path: Path) -> set[frozenset[str]]:
+    """Load SHA-pair allowlist. Returns set of frozensets so lookup is order-free."""
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    out: set[frozenset[str]] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            a = row.get("sha256_a", "").strip()
+            b = row.get("sha256_b", "").strip()
+            if a and b:
+                out.add(frozenset({a, b}))
+    return out
+
+
+def append_not_duplicate(
+    path: Path,
+    sha_a: str, sha_b: str,
+    name_a: str = "", name_b: str = "",
+    note: str = "",
+) -> None:
+    """Append a pair to the not-duplicates allowlist. Stores SHAs in sorted order."""
+    is_new = not path.exists() or path.stat().st_size == 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    a, b = sorted([sha_a, sha_b])
+    if a == sha_a:
+        na, nb = name_a, name_b
+    else:
+        na, nb = name_b, name_a
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=NOT_DUPLICATES_COLS)
+        if is_new:
+            w.writeheader()
+        w.writerow({
+            "sha256_a": a,
+            "sha256_b": b,
+            "name_a": na,
+            "name_b": nb,
+            "decided_at": date.today().isoformat(),
+            "note": note,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Path defaults — derive skiplist/not_duplicates location from manifest
+# ---------------------------------------------------------------------------
+
+def default_skiplist_path(manifest_path: Path) -> Path:
+    return manifest_path.parent / "hash_skiplist.csv"
+
+
+def default_not_duplicates_path(manifest_path: Path) -> Path:
+    return manifest_path.parent / "not_duplicates.csv"
+
+
 def decide_winner(
     incoming_has_exif: bool, incoming_size: int,
     existing_has_exif: bool, existing_size: int,
@@ -292,12 +392,20 @@ def find_duplicates_against_manifest(
     incoming_fp: FingerprintRecord,
     existing_records: list[FingerprintRecord],
     photos_root: Path,
+    not_duplicates_pairs: Optional[set[frozenset[str]]] = None,
 ) -> Optional[DupDecision]:
     """
     Three-stage duplicate search against existing_records.
     Returns a DupDecision or None (not a duplicate).
     Videos skip stages 2-3 and use SHA-256 only.
+
+    not_duplicates_pairs: optional set of frozenset({sha_a, sha_b}) pairs
+        the user has declared NOT a duplicate. Such pairs are suppressed at
+        the ORB stage. (SHA-256 exact matches are not suppressed — those are
+        byte-identical, not a perceptual judgment.)
     """
+    not_dup = not_duplicates_pairs or set()
+
     # Stage 1 — SHA-256 exact match
     for rec in existing_records:
         if rec.sha256 == incoming_fp.sha256:
@@ -332,9 +440,8 @@ def find_duplicates_against_manifest(
     if not candidates:
         return None
 
-    # Stage 3 — ORB verify; take best inlier count
-    best_inliers = 0
-    best_rec: Optional[FingerprintRecord] = None
+    # Stage 3 — ORB verify; collect every match above threshold, then filter
+    matches: list[tuple[int, FingerprintRecord]] = []
     for rec in candidates:
         existing_abs = photos_root / rec.filepath
         if not existing_abs.exists():
@@ -343,12 +450,20 @@ def find_duplicates_against_manifest(
             n = orb_inliers(incoming_path, existing_abs)
         except Exception:
             n = 0
-        if n > best_inliers:
-            best_inliers = n
-            best_rec = rec
+        if n >= CONFIG.ORB_REVIEW_INLIERS:
+            matches.append((n, rec))
 
-    if best_rec is None or best_inliers < CONFIG.ORB_REVIEW_INLIERS:
+    # Suppress pairs the user has already marked as not-duplicate
+    if not_dup:
+        matches = [
+            (n, rec) for n, rec in matches
+            if frozenset({incoming_fp.sha256, rec.sha256}) not in not_dup
+        ]
+
+    if not matches:
         return None
+
+    best_inliers, best_rec = max(matches, key=lambda x: x[0])
 
     classification = (
         "near_definite" if best_inliers >= CONFIG.ORB_DEFINITE_DUP_INLIERS else "review"
@@ -445,13 +560,46 @@ def append_review_log(
 # CLI
 # ---------------------------------------------------------------------------
 
-def _cli_scan(folder: Path) -> None:
-    """Find duplicates within a folder using all three stages."""
+def _cli_scan(folder: Path, quarantine_dupes: bool = False) -> None:
+    """Find duplicates within a folder using all three stages.
+
+    If quarantine_dupes is True, DEFINITE matches (exact / near_definite) are
+    moved into REVIEW/<classification>/ and a row is appended to review_log.csv.
+    REVIEW-band matches are reported but never auto-quarantined — user decides.
+    """
+    import os
     import time
+
+    not_dup: set[frozenset[str]] = set()
+    review_root: Optional[Path] = None
+    photos_root: Optional[Path] = None
+    library_root: Optional[Path] = None
+    if quarantine_dupes:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).parent / ".env")
+        review_root  = Path(os.environ["REVIEW"])
+        library_root = Path(os.environ["LIBRARY"])
+        photos_root  = Path(os.environ["INBOX"]).parent
+        manifest     = Path(os.environ["MANIFEST"])
+        not_dup = load_not_duplicates(default_not_duplicates_path(manifest))
+    else:
+        # still load not_dup if available, so audits suppress allowlisted pairs
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent / ".env")
+            manifest_env = os.environ.get("MANIFEST")
+            if manifest_env:
+                not_dup = load_not_duplicates(default_not_duplicates_path(Path(manifest_env)))
+        except Exception:
+            pass
 
     files = [f for f in folder.rglob("*") if f.is_file() and file_type_for(f)]
     total = len(files)
     print(f"Scanning {total} files in {folder} ...", flush=True)
+    if not_dup:
+        print(f"  (loaded {len(not_dup)} allowlisted pairs from not_duplicates.csv)", flush=True)
+    if quarantine_dupes:
+        print(f"  --quarantine enabled: DEFINITE matches will be moved to {review_root}", flush=True)
 
     # ----- Phase 1: fingerprinting -----
     print(f"\n[1/2] Fingerprinting {total} files (SHA-256 + dHash + colorhash) ...", flush=True)
@@ -491,10 +639,22 @@ def _cli_scan(folder: Path) -> None:
     n_dupes = 0
 
     for i, (path, fp) in enumerate(fps, 1):
-        decision = find_duplicates_against_manifest(path, fp, seen, folder)
+        decision = find_duplicates_against_manifest(
+            path, fp, seen, folder, not_duplicates_pairs=not_dup
+        )
         if decision and decision.classification in ("exact", "near_definite"):
             definite.append(decision)
             n_dupes += 1
+            if quarantine_dupes:
+                try:
+                    q_path = quarantine(folder, decision, review_root)  # type: ignore[arg-type]
+                    append_review_log(
+                        review_root, decision, q_path,  # type: ignore[arg-type]
+                        photos_root if photos_root else folder,  # type: ignore[arg-type]
+                        library_root if library_root else folder,  # type: ignore[arg-type]
+                    )
+                except Exception as e:
+                    print(f"  WARN  quarantine failed for {path.name}: {e}", flush=True)
         elif decision and decision.classification == "review":
             review.append(decision)
             n_dupes += 1
@@ -549,10 +709,12 @@ def _cli_apply_review() -> None:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
 
-    review_root  = Path(os.environ["REVIEW"])
-    library_root = Path(os.environ["LIBRARY"])
-    photos_root  = Path(os.environ["INBOX"]).parent
-    manifest     = Path(os.environ["MANIFEST"])
+    review_root    = Path(os.environ["REVIEW"])
+    library_root   = Path(os.environ["LIBRARY"])
+    photos_root    = Path(os.environ["INBOX"]).parent
+    manifest       = Path(os.environ["MANIFEST"])
+    skiplist_path  = Path(os.environ.get("SKIPLIST", default_skiplist_path(manifest)))
+    not_dup_path   = Path(os.environ.get("NOT_DUPLICATES", default_not_duplicates_path(manifest)))
 
     log_path = review_root / "review_log.csv"
     if not log_path.exists():
@@ -569,6 +731,7 @@ def _cli_apply_review() -> None:
     for row in rows:
         status = (row.get("status") or "").strip().lower()
         review_file = Path(row.get("file_in_review", ""))
+        classification = (row.get("classification") or "").strip().lower()
 
         if not status:
             pending.append(row)
@@ -576,9 +739,16 @@ def _cli_apply_review() -> None:
 
         if status == "delete":
             try:
+                # Write to skiplist BEFORE unlink so we still have the file to hash
                 if review_file.exists():
+                    sha = _sha256(review_file)
+                    append_skiplist(
+                        skiplist_path, sha, review_file.name,
+                        source="review_delete",
+                        note=f"classification={classification}",
+                    )
                     review_file.unlink()
-                    print(f"  deleted  {review_file.name}")
+                    print(f"  deleted  {review_file.name}  (sha added to skiplist)")
                 else:
                     print(f"  (already gone) {review_file.name}")
                 deleted += 1
@@ -606,7 +776,25 @@ def _cli_apply_review() -> None:
 
                 fp = compute_fingerprint(dest, photos_root)
                 append_manifest(manifest, [fp])
-                print(f"  restored {review_file.name} -> {dest.relative_to(photos_root)}")
+
+                # For perceptual matches, log the pair so future scans don't re-flag them
+                if classification in ("review", "near_definite"):
+                    library_file = Path(row.get("file_in_library", ""))
+                    if library_file.exists():
+                        sha_b = _sha256(library_file)
+                        append_not_duplicate(
+                            not_dup_path,
+                            sha_a=fp.sha256, sha_b=sha_b,
+                            name_a=dest.name, name_b=library_file.name,
+                            note=f"kept from {classification}",
+                        )
+                        print(f"  restored {review_file.name} -> {dest.relative_to(photos_root)}  "
+                              f"(pair allowlisted)")
+                    else:
+                        print(f"  restored {review_file.name} -> {dest.relative_to(photos_root)}  "
+                              f"(WARN: library twin missing, no pair logged)")
+                else:
+                    print(f"  restored {review_file.name} -> {dest.relative_to(photos_root)}")
                 restored += 1
             except Exception as e:
                 errors.append(f"keep {review_file}: {e}")
@@ -628,6 +816,100 @@ def _cli_apply_review() -> None:
         print("\nErrors:")
         for e in errors:
             print(f"  {e}")
+
+
+def _cli_prune_manifest() -> None:
+    """Drop manifest rows whose file is missing from disk; record SHAs in the skiplist."""
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+
+    manifest      = Path(os.environ["MANIFEST"])
+    photos_root   = Path(os.environ["INBOX"]).parent
+    skiplist_path = Path(os.environ.get("SKIPLIST", default_skiplist_path(manifest)))
+
+    records = load_manifest(manifest)
+    print(f"Loaded {len(records)} manifest rows from {manifest}")
+
+    keep: list[FingerprintRecord] = []
+    pruned: list[FingerprintRecord] = []
+
+    for r in records:
+        if (photos_root / r.filepath).exists():
+            keep.append(r)
+        else:
+            pruned.append(r)
+
+    if not pruned:
+        print("All manifest rows point to existing files. Nothing to prune.")
+        return
+
+    print(f"Found {len(pruned)} phantom rows (file missing on disk):")
+    for r in pruned[:20]:
+        print(f"  {r.filepath}")
+    if len(pruned) > 20:
+        print(f"  ... and {len(pruned) - 20} more")
+
+    # Rewrite manifest with only existing files
+    with open(manifest, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=MANIFEST_COLS)
+        w.writeheader()
+        for r in keep:
+            w.writerow(r.to_csv_row())
+
+    # Add SHAs to skiplist so future re-imports of the same bytes get caught
+    for r in pruned:
+        append_skiplist(
+            skiplist_path, r.sha256, Path(r.filepath).name,
+            source="pruned_phantom",
+            note=f"was at {r.filepath}",
+        )
+
+    print(f"\nPruned {len(pruned)} rows; added their SHAs to {skiplist_path.name}")
+    print(f"Manifest now has {len(keep)} rows")
+
+
+def _cli_skip(file: Path) -> None:
+    """Compute the SHA-256 of a file and add it to the skiplist."""
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+
+    manifest      = Path(os.environ["MANIFEST"])
+    skiplist_path = Path(os.environ.get("SKIPLIST", default_skiplist_path(manifest)))
+
+    if not file.exists():
+        print(f"File not found: {file}")
+        return
+    sha = _sha256(file)
+    append_skiplist(skiplist_path, sha, file.name, source="manual")
+    print(f"Added {file.name} (sha={sha[:12]}...) to {skiplist_path.name}")
+
+
+def _cli_allow(file_a: Path, file_b: Path) -> None:
+    """Mark two files as a known-not-duplicate pair."""
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env")
+
+    manifest     = Path(os.environ["MANIFEST"])
+    not_dup_path = Path(os.environ.get("NOT_DUPLICATES", default_not_duplicates_path(manifest)))
+
+    if not file_a.exists() or not file_b.exists():
+        print(f"One or both files not found: {file_a}, {file_b}")
+        return
+    sha_a = _sha256(file_a)
+    sha_b = _sha256(file_b)
+    if sha_a == sha_b:
+        print("These files have the same SHA-256 — they are byte-identical, not a perceptual pair.")
+        return
+    append_not_duplicate(
+        not_dup_path,
+        sha_a=sha_a, sha_b=sha_b,
+        name_a=file_a.name, name_b=file_b.name,
+        note="manual",
+    )
+    print(f"Allowlisted pair: {file_a.name} <-> {file_b.name} in {not_dup_path.name}")
 
 
 def _cli_against_library(file: Path) -> None:
@@ -655,25 +937,46 @@ def _cli_against_library(file: Path) -> None:
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python dedup.py scan <folder>")
+        print("  python dedup.py scan <folder> [--quarantine]")
         print("  python dedup.py against-library <file>")
         print("  python dedup.py apply-review")
+        print("  python dedup.py prune-manifest")
+        print("  python dedup.py skip <file>")
+        print("  python dedup.py allow <fileA> <fileB>")
         sys.exit(1)
 
     cmd = sys.argv[1]
+    args = sys.argv[2:]
 
     if cmd == "apply-review":
         _cli_apply_review()
+    elif cmd == "prune-manifest":
+        _cli_prune_manifest()
     elif cmd == "scan":
-        if len(sys.argv) < 3:
+        if not args:
             print("scan requires a folder path")
             sys.exit(1)
-        _cli_scan(Path(sys.argv[2]))
+        quarantine_flag = "--quarantine" in args
+        positional = [a for a in args if not a.startswith("--")]
+        if not positional:
+            print("scan requires a folder path")
+            sys.exit(1)
+        _cli_scan(Path(positional[0]), quarantine_dupes=quarantine_flag)
     elif cmd == "against-library":
-        if len(sys.argv) < 3:
+        if not args:
             print("against-library requires a file path")
             sys.exit(1)
-        _cli_against_library(Path(sys.argv[2]))
+        _cli_against_library(Path(args[0]))
+    elif cmd == "skip":
+        if not args:
+            print("skip requires a file path")
+            sys.exit(1)
+        _cli_skip(Path(args[0]))
+    elif cmd == "allow":
+        if len(args) < 2:
+            print("allow requires two file paths")
+            sys.exit(1)
+        _cli_allow(Path(args[0]), Path(args[1]))
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

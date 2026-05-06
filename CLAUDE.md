@@ -159,10 +159,26 @@ Write to LOGS\YYYYMMDD_HHMMSS_run.log after every run:
 It can also run ad hoc:
 
 ```
-python dedup.py scan <folder>           # find duplicates within a folder
-python dedup.py against-library <file>  # check one file against the manifest
-python dedup.py apply-review            # process review_log.csv decisions
+python dedup.py scan <folder> [--quarantine]   # find duplicates; optionally quarantine
+python dedup.py against-library <file>          # check one file against the manifest
+python dedup.py apply-review                    # process review_log.csv decisions
+python dedup.py prune-manifest                  # drop rows for missing files; SHAs to skiplist
+python dedup.py skip <file>                     # manually add a SHA to the skiplist
+python dedup.py allow <fileA> <fileB>           # manually allowlist a not-duplicate pair
 ```
+
+### Auxiliary lists alongside the manifest
+
+```
+hash_manifest.csv     "what's in the library right now"
+hash_skiplist.csv     "SHAs we never want to ingest again" (silent discard on import)
+not_duplicates.csv    "pairs declared NOT a duplicate" (suppresses ORB false positives)
+```
+
+- pipeline.py checks the skiplist before find_duplicates_against_manifest. SHA hit -> silent discard.
+- find_duplicates_against_manifest checks the not_duplicates set after ORB. Allowlisted pair -> treat as not a duplicate.
+- apply-review writes to both: `delete` -> skiplist; `keep` on a perceptual row -> not_duplicates pair.
+- prune-manifest writes pruned-phantom SHAs into the skiplist so future imports stay caught.
 
 ### Review workflow
 

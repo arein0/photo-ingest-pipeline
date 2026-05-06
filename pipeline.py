@@ -16,6 +16,10 @@ from dedup import (
     find_duplicates_against_manifest,
     load_manifest,
     append_manifest,
+    load_skiplist,
+    load_not_duplicates,
+    default_skiplist_path,
+    default_not_duplicates_path,
     quarantine,
     append_review_log,
     file_type_for,
@@ -46,6 +50,11 @@ MANIFEST     = _require_env("MANIFEST")
 LOGS_DIR     = _require_env("LOGS")
 REVIEW       = _require_env("REVIEW")
 PHOTOS_ROOT  = INBOX.parent
+
+# Skiplist + not-duplicates allowlist live next to the manifest by default.
+# Override with SKIPLIST / NOT_DUPLICATES env vars if you want them elsewhere.
+SKIPLIST       = Path(os.environ.get("SKIPLIST",       default_skiplist_path(MANIFEST)))
+NOT_DUPLICATES = Path(os.environ.get("NOT_DUPLICATES", default_not_duplicates_path(MANIFEST)))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -79,6 +88,7 @@ stats: dict = {
     "dupes_exact": [],
     "dupes_near_definite": [],
     "dupes_review": [],
+    "skiplisted": [],
     "photos_promoted": 0,
     "videos_promoted": 0,
     "errors": [],
@@ -198,6 +208,8 @@ def intra_batch_dedup(all_files: list[Path]) -> list[Path]:
 
 def process_inbox(
     working_records: list[FingerprintRecord],
+    skiplist: set[str],
+    not_duplicates: set[frozenset[str]],
 ) -> tuple[list[FingerprintRecord], list[tuple[Path, FingerprintRecord]], list[tuple[Path, FingerprintRecord]]]:
     """
     Returns:
@@ -243,10 +255,19 @@ def process_inbox(
                 work_path.rename(renamed)
                 work_path = renamed
 
-                # 2d — three-stage dedup
+                # 2d — skiplist check, then three-stage dedup
                 fp = compute_fingerprint(work_path, PHOTOS_ROOT)
+                if fp.sha256 in skiplist:
+                    logger.info(
+                        f"Skiplist hit: {work_path.name} discarded silently "
+                        f"(sha={fp.sha256[:12]}...)"
+                    )
+                    stats["skiplisted"].append({"file": work_path.name, "sha": fp.sha256})
+                    work_path.unlink()
+                    continue
                 decision = find_duplicates_against_manifest(
-                    work_path, fp, working_records, PHOTOS_ROOT
+                    work_path, fp, working_records, PHOTOS_ROOT,
+                    not_duplicates_pairs=not_duplicates,
                 )
 
                 if decision is not None:
@@ -299,8 +320,17 @@ def process_inbox(
                 work_path = renamed
 
                 fp = compute_fingerprint(work_path, PHOTOS_ROOT)
+                if fp.sha256 in skiplist:
+                    logger.info(
+                        f"Skiplist hit: {work_path.name} discarded silently "
+                        f"(sha={fp.sha256[:12]}...)"
+                    )
+                    stats["skiplisted"].append({"file": work_path.name, "sha": fp.sha256})
+                    work_path.unlink()
+                    continue
                 decision = find_duplicates_against_manifest(
-                    work_path, fp, working_records, PHOTOS_ROOT
+                    work_path, fp, working_records, PHOTOS_ROOT,
+                    not_duplicates_pairs=not_duplicates,
                 )
 
                 if decision is not None:
@@ -419,6 +449,7 @@ def write_run_log(run_start: datetime) -> None:
         f"  exact (SHA-256)        : {len(stats['dupes_exact'])}",
         f"  near-definite (ORB hi) : {len(stats['dupes_near_definite'])}",
         f"  review (ORB borderline): {len(stats['dupes_review'])}",
+        f"  skiplisted (silent)    : {len(stats['skiplisted'])}",
     ]
 
     for label, bucket in (
@@ -462,6 +493,12 @@ def main() -> None:
     working_records = load_manifest(MANIFEST)
     logger.info(f"Manifest loaded: {len(working_records)} existing entries")
 
+    skiplist = load_skiplist(SKIPLIST)
+    not_duplicates = load_not_duplicates(NOT_DUPLICATES)
+    logger.info(
+        f"Skiplist: {len(skiplist)} SHAs; not_duplicates: {len(not_duplicates)} pairs"
+    )
+
     inbox_files = [f for f in INBOX.rglob("*") if f.is_file()]
     if not inbox_files:
         logger.info("_Inbox is empty. Nothing to process.")
@@ -470,7 +507,9 @@ def main() -> None:
 
     # Stage 2 — Bronze -> Silver
     logger.info("--- Stage 2: Bronze -> Silver ---")
-    working_records, staged_photos, staged_videos = process_inbox(working_records)
+    working_records, staged_photos, staged_videos = process_inbox(
+        working_records, skiplist, not_duplicates,
+    )
     logger.info(f"Stage 2 complete: {len(staged_photos)} photos staged, {len(staged_videos)} videos staged")
 
     # Stage 3 — Silver -> Gold
