@@ -447,32 +447,74 @@ def append_review_log(
 
 def _cli_scan(folder: Path) -> None:
     """Find duplicates within a folder using all three stages."""
-    files = [f for f in folder.rglob("*") if f.is_file() and file_type_for(f)]
-    print(f"Scanning {len(files)} files in {folder} ...")
+    import time
 
-    # Compute fingerprints
+    files = [f for f in folder.rglob("*") if f.is_file() and file_type_for(f)]
+    total = len(files)
+    print(f"Scanning {total} files in {folder} ...", flush=True)
+
+    # ----- Phase 1: fingerprinting -----
+    print(f"\n[1/2] Fingerprinting {total} files (SHA-256 + dHash + colorhash) ...", flush=True)
     fps: list[tuple[Path, FingerprintRecord]] = []
-    for f in files:
+    t0 = time.time()
+    last_report = t0
+    PROGRESS_EVERY = max(1, total // 200)  # roughly 200 progress lines
+
+    for i, f in enumerate(files, 1):
         try:
             fp = compute_fingerprint(f, folder)
             fps.append((f, fp))
         except Exception as e:
-            print(f"  WARN  fingerprint failed: {f.name}: {e}")
+            print(f"  WARN  fingerprint failed: {f.name}: {e}", flush=True)
 
-    # Check each file against all preceding ones (avoid double-reporting)
+        if i % PROGRESS_EVERY == 0 or i == total:
+            now = time.time()
+            elapsed = now - t0
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else 0
+            print(
+                f"  [{i}/{total}] fingerprinted  "
+                f"{rate:.1f} files/s  elapsed={_fmt_dur(elapsed)}  eta={_fmt_dur(eta)}",
+                flush=True,
+            )
+            last_report = now
+
+    print(f"  Phase 1 done in {_fmt_dur(time.time() - t0)}", flush=True)
+
+    # ----- Phase 2: matching against everything seen so far -----
+    print(f"\n[2/2] Matching candidates with ORB ...", flush=True)
     seen: list[FingerprintRecord] = []
     definite: list[DupDecision] = []
     review: list[DupDecision] = []
 
-    for path, fp in fps:
+    t1 = time.time()
+    n_dupes = 0
+
+    for i, (path, fp) in enumerate(fps, 1):
         decision = find_duplicates_against_manifest(path, fp, seen, folder)
         if decision and decision.classification in ("exact", "near_definite"):
             definite.append(decision)
+            n_dupes += 1
         elif decision and decision.classification == "review":
             review.append(decision)
+            n_dupes += 1
         else:
             seen.append(fp)
 
+        if i % PROGRESS_EVERY == 0 or i == total:
+            elapsed = time.time() - t1
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else 0
+            print(
+                f"  [{i}/{total}] matched  "
+                f"definite={len(definite)} review={len(review)}  "
+                f"{rate:.1f} files/s  elapsed={_fmt_dur(elapsed)}  eta={_fmt_dur(eta)}",
+                flush=True,
+            )
+
+    print(f"  Phase 2 done in {_fmt_dur(time.time() - t1)}", flush=True)
+
+    # ----- Results -----
     print(f"\nDEFINITE duplicates ({len(definite)}):")
     for d in definite:
         print(f"  [{d.method}  score={d.score:.0f}]  {d.incoming_path.name}  <->  {d.existing_relpath}  keep={d.keep}")
@@ -482,6 +524,17 @@ def _cli_scan(folder: Path) -> None:
         print(f"  [orb  inliers={d.score:.0f}]  {d.incoming_path.name}  <->  {d.existing_relpath}")
 
     print(f"\n{len(definite)} definite, {len(review)} review, {len(fps) - len(definite) - len(review)} unique")
+    print(f"Total wall time: {_fmt_dur(time.time() - t0)}")
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Format a duration as h:mm:ss or m:ss."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 def _cli_apply_review() -> None:
