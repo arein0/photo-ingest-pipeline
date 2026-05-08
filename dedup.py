@@ -143,12 +143,21 @@ def _load_gray_for_orb(path: Path) -> "cv2.Mat":
     return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
 
-def orb_inliers(path_a: Path, path_b: Path) -> int:
+def orb_descriptors(path: Path):
+    """Compute ORB keypoints + descriptors for one image.
+    Returns (keypoints, descriptors) or (None, None) on failure.
+    Expensive (~250ms per image). Cache the result per file for reuse."""
     orb = _get_orb()
-    gray_a = _load_gray_for_orb(path_a)
-    gray_b = _load_gray_for_orb(path_b)
-    kp_a, des_a = orb.detectAndCompute(gray_a, None)
-    kp_b, des_b = orb.detectAndCompute(gray_b, None)
+    gray = _load_gray_for_orb(path)
+    kp, des = orb.detectAndCompute(gray, None)
+    if des is None or len(kp) < CONFIG.ORB_MIN_GOOD_MATCHES:
+        return None, None
+    return kp, des
+
+
+def orb_match_descriptors(kp_a, des_a, kp_b, des_b) -> int:
+    """Match two pre-computed descriptor sets and return RANSAC inlier count.
+    Cheap (~30-40ms per pair) -- the heavy lifting is in orb_descriptors."""
     if des_a is None or des_b is None:
         return 0
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
@@ -163,6 +172,43 @@ def orb_inliers(path_a: Path, path_b: Path) -> int:
     if mask is None:
         return 0
     return int(mask.sum())
+
+
+def orb_inliers(path_a: Path, path_b: Path) -> int:
+    """Backward-compatible single-call interface. Internally splits into
+    descriptor extraction + match, so ad-hoc callers still work, but loop
+    callers should use orb_descriptors() + orb_match_descriptors() with
+    caching to avoid recomputing descriptors for the same file repeatedly."""
+    kp_a, des_a = orb_descriptors(path_a)
+    kp_b, des_b = orb_descriptors(path_b)
+    return orb_match_descriptors(kp_a, des_a, kp_b, des_b)
+
+
+# ---- Descriptor cache for library photos --------------------------------
+# Used by find_duplicates_against_manifest. When ingesting a batch of N new
+# photos against a library of M existing photos, the same library photo can
+# easily appear as a candidate for several different incoming photos. Without
+# caching we'd recompute its descriptors every time -- the same bug that
+# tanked ingest performance before this fix. Cache size is bounded so the
+# process doesn't blow up on huge libraries; for typical batches an LRU of
+# 1024 covers the working set.
+_orb_cache: dict[str, tuple] = {}
+_ORB_CACHE_MAX = 1024
+
+def _orb_descriptors_cached(path: Path):
+    key = str(path)
+    if key in _orb_cache:
+        return _orb_cache[key]
+    kp, des = orb_descriptors(path)
+    if len(_orb_cache) >= _ORB_CACHE_MAX:
+        # Evict an arbitrary old entry; we don't need true LRU semantics
+        _orb_cache.pop(next(iter(_orb_cache)))
+    _orb_cache[key] = (kp, des)
+    return kp, des
+
+def clear_orb_cache() -> None:
+    """Call between unrelated batches to free memory."""
+    _orb_cache.clear()
 
 # ---------------------------------------------------------------------------
 # Hashing helpers
@@ -441,13 +487,25 @@ def find_duplicates_against_manifest(
         return None
 
     # Stage 3 — ORB verify; collect every match above threshold, then filter
+    # IMPORTANT: compute the incoming photo's ORB descriptors ONCE here, then
+    # reuse them across every candidate. Without this, every pair comparison
+    # recomputes the same incoming descriptors -- a multi-fold slowdown that
+    # makes 1000+-image ingest take hours.
     matches: list[tuple[int, FingerprintRecord]] = []
+    try:
+        kp_in, des_in = orb_descriptors(incoming_path)
+    except Exception:
+        kp_in, des_in = None, None
+    if des_in is None:
+        return None  # nothing to match against; treat as not-duplicate
+
     for rec in candidates:
         existing_abs = photos_root / rec.filepath
         if not existing_abs.exists():
             continue
         try:
-            n = orb_inliers(incoming_path, existing_abs)
+            kp_ex, des_ex = _orb_descriptors_cached(existing_abs)
+            n = orb_match_descriptors(kp_in, des_in, kp_ex, des_ex)
         except Exception:
             n = 0
         if n >= CONFIG.ORB_REVIEW_INLIERS:

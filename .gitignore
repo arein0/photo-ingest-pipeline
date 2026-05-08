@@ -21,6 +21,9 @@ env/
 .spyderproject.cfg
 .spyproject/
 
+# Claude Code session settings
+.claude/
+
 # OS
 Thumbs.db
 .DS_Store
